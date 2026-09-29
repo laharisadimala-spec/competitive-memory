@@ -51,44 +51,56 @@ strategy_service = None
 investigation_service = None
 
 
+def init_sync_services():
+    """Synchronously initialize services and load data."""
+    global competitor_service, pattern_service, strategy_service, investigation_service
+    if competitor_service is None:
+        competitor_service = get_competitor_service()
+        pattern_service = get_pattern_service()
+        strategy_service = get_strategy_service()
+        investigation_service = get_investigation_service()
+        
+        events, competitors = generate_synthetic_dataset()
+        event_models = []
+        for e in events:
+            e['date'] = datetime.fromisoformat(e['date']) if isinstance(e['date'], str) else e['date']
+            event_models.append(CompetitorEvent(**e))
+        
+        competitor_models = []
+        for c in competitors:
+            c['last_updated'] = datetime.utcnow()
+            c['event_count'] = len([e for e in event_models if e.competitor == c['name']])
+            competitor_models.append(Competitor(**c))
+        
+        competitor_service.load_synthetic_data(
+            [e.dict() for e in event_models],
+            [c.dict() for c in competitor_models]
+        )
+
+
+async def ensure_hindsight():
+    """Ensure hindsight service is initialized and populated."""
+    global hindsight_service
+    init_sync_services()
+    if hindsight_service is None:
+        hindsight_service = await get_hindsight_service()
+        for event in competitor_service.get_all_events():
+            await hindsight_service.retain_event(event.dict())
+    return hindsight_service
+
+
+# Initialize sync services at module import
+init_sync_services()
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup."""
-    global hindsight_service, competitor_service, pattern_service, strategy_service, investigation_service
-    
-    hindsight_service = await get_hindsight_service()
-    competitor_service = get_competitor_service()
-    pattern_service = get_pattern_service()
-    strategy_service = get_strategy_service()
-    investigation_service = get_investigation_service()
-    
-    # Load synthetic data
-    events, competitors = generate_synthetic_dataset()
-    
-    # Convert to models and load
-    event_models = []
-    for e in events:
-        e['date'] = datetime.fromisoformat(e['date']) if isinstance(e['date'], str) else e['date']
-        event_models.append(CompetitorEvent(**e))
-    
-    competitor_models = []
-    for c in competitors:
-        c['last_updated'] = datetime.utcnow()
-        c['event_count'] = len([e for e in event_models if e.competitor == c['name']])
-        competitor_models.append(Competitor(**c))
-    
-    competitor_service.load_synthetic_data(
-        [e.dict() for e in event_models],
-        [c.dict() for c in competitor_models]
-    )
-    
-    # Retain events in Hindsight
-    for event in event_models:
-        await hindsight_service.retain_event(event.dict())
-    
+    await ensure_hindsight()
     print("[OK] Competitive Memory initialized")
-    print(f"[OK] Loaded {len(event_models)} events across {len(competitor_models)} competitors")
+    print(f"[OK] Loaded {len(competitor_service.get_all_events())} events across {len(competitor_service.get_all_competitors())} competitors")
     print(f"[OK] Memory service: {'Hindsight' if hindsight_service.connected else 'Demo Mode'}")
+
 
 
 # ============================================================
@@ -98,10 +110,11 @@ async def startup_event():
 @app.get("/health")
 async def health_check():
     """System health check."""
+    hs = await ensure_hindsight()
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "memory_service": hindsight_service.get_memory_status() if hindsight_service else None
+        "memory_service": hs.get_memory_status() if hs else None
     }
 
 
@@ -491,13 +504,15 @@ async def identify_gaps(competitor: Optional[str] = Query(None)):
 @app.get("/api/memory/status")
 async def memory_status():
     """Get memory service status."""
-    return hindsight_service.get_memory_status()
+    hs = await ensure_hindsight()
+    return hs.get_memory_status()
 
 
 @app.get("/api/memory/all")
 async def get_all_memories(competitor: Optional[str] = Query(None)):
     """Get all stored memories."""
-    memories = await hindsight_service.get_all_memories(competitor)
+    hs = await ensure_hindsight()
+    memories = await hs.get_all_memories(competitor)
     
     return {
         "memories": memories,
@@ -509,14 +524,16 @@ async def get_all_memories(competitor: Optional[str] = Query(None)):
 @app.post("/api/memory/recall")
 async def recall_memory(query: str, competitor: Optional[str] = Query(None)):
     """Recall relevant memories from Hindsight or the transparent demo memory."""
-    memories = await hindsight_service.recall_similar(query, competitor=competitor, limit=12)
-    return {"query": query, "memories": memories, "count": len(memories), "source": hindsight_service.get_memory_status()["mode"]}
+    hs = await ensure_hindsight()
+    memories = await hs.recall_similar(query, competitor=competitor, limit=12)
+    return {"query": query, "memories": memories, "count": len(memories), "source": hs.get_memory_status()["mode"]}
 
 
 @app.post("/api/memory/retain")
 async def retain_event(event: dict):
     """Store an event in Hindsight memory."""
-    result = await hindsight_service.retain_event(event)
+    hs = await ensure_hindsight()
+    result = await hs.retain_event(event)
     
     return {
         "success": result["success"],
@@ -573,8 +590,9 @@ async def demo_query(question: str):
         }
     
     elif "seen this before" in question_lower or "similar" in question_lower:
+        hs = await ensure_hindsight()
         current = apexai_events[-1] if apexai_events else None
-        recalled = await hindsight_service.recall_similar(
+        recalled = await hs.recall_similar(
             query=f"{current.title if current else question} {current.description if current else question}",
             competitor="ApexAI",
             limit=5
@@ -586,7 +604,7 @@ async def demo_query(question: str):
             "answer": "Yes, similar historical context was found in competitive memory.",
             "historical_matches": matches,
             "match_count": len(matches),
-            "memory_source": hindsight_service.get_memory_status()["mode"]
+            "memory_source": hs.get_memory_status()["mode"]
         }
 
     elif "happened last time" in question_lower or "last time" in question_lower:
@@ -659,12 +677,13 @@ async def get_war_room():
 @app.get("/")
 async def root():
     """Root endpoint."""
+    hs = await ensure_hindsight()
     return {
         "name": "Competitive Memory",
         "tagline": "Your company's competitive memory",
         "version": "1.0.0",
         "status": "running",
-        "memory_mode": hindsight_service.get_memory_status()["mode"] if hindsight_service else "unknown"
+        "memory_mode": hs.get_memory_status()["mode"] if hs else "unknown"
     }
 
 
